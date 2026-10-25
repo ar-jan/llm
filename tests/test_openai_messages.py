@@ -601,6 +601,33 @@ def _reasoning_content_stream(reasoning_tokens=None):
     yield b"data: [DONE]\n\n"
 
 
+def _reasoning_tool_call_stream():
+    """Reasoning and a tool call arrive in the same streamed delta."""
+    yield _sse({"role": "assistant", "content": None})
+    yield _sse(
+        {"reasoning_content": "I should look up the weather."},
+        tool_calls=[
+            {
+                "index": 0,
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "get_weather", "arguments": ""},
+            }
+        ],
+    )
+    yield _sse(
+        {},
+        tool_calls=[
+            {
+                "index": 0,
+                "function": {"arguments": '{"city": "Paris"}'},
+            }
+        ],
+    )
+    yield _sse({}, finish_reason="tool_calls")
+    yield b"data: [DONE]\n\n"
+
+
 REASONING_CONTENT_MESSAGES = [
     llm.Message(
         role="assistant",
@@ -626,6 +653,7 @@ class TestReasoningContent:
         assert [e.type for e in events] == ["reasoning", "reasoning", "text"]
         assert response.text() == "4"
         assert response.messages() == REASONING_CONTENT_MESSAGES
+        assert response.response_json["reasoning_content"] == "Two plus two is four."
 
     def test_no_redacted_marker_when_reasoning_text_present(self, httpx2_mock):
         # DeepSeek also reports reasoning_tokens; the real text should not be
@@ -668,6 +696,10 @@ class TestReasoningContent:
         response = model.prompt("hi", key=API_KEY, stream=False)
         assert response.text() == "4"
         assert response.messages() == REASONING_CONTENT_MESSAGES
+        assert (
+            response.response_json["choices"][0]["message"]["reasoning_content"]
+            == "Two plus two is four."
+        )
 
     @pytest.mark.asyncio
     async def test_async_streamed_reasoning_content(self, httpx2_mock):
@@ -682,6 +714,80 @@ class TestReasoningContent:
         types = [e.type async for e in response.astream_events()]
         assert types == ["reasoning", "reasoning", "text"]
         assert await response.messages() == REASONING_CONTENT_MESSAGES
+        assert response.response_json["reasoning_content"] == "Two plus two is four."
+
+
+class TestReasoningWithToolCalls:
+    def test_streamed_reasoning_precedes_tool_call(self, httpx2_mock):
+        httpx2_mock.add_response(
+            method="POST",
+            url="https://api.openai.com/v1/chat/completions",
+            stream=IteratorStream(_reasoning_tool_call_stream()),
+            headers={"Content-Type": "text/event-stream"},
+        )
+
+        def get_weather(city: str) -> str:
+            "Look up the weather."
+            return "sunny"
+
+        model = llm.get_model("gpt-4o-mini")
+        response = model.prompt("weather?", tools=[get_weather], key=API_KEY)
+        response.text()
+        parts = response.messages()[0].parts
+        assert [type(part).__name__ for part in parts] == [
+            "ReasoningPart",
+            "ToolCallPart",
+        ]
+        assert parts[0].text == "I should look up the weather."
+
+    def test_non_streamed_reasoning_precedes_tool_call(self, httpx2_mock):
+        httpx2_mock.add_response(
+            method="POST",
+            url="https://api.openai.com/v1/chat/completions",
+            json={
+                "model": "gpt-4o-mini",
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 9,
+                    "total_tokens": 10,
+                },
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "reasoning_content": "I should look up the weather.",
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "get_weather",
+                                        "arguments": '{"city": "Paris"}',
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+            },
+        )
+
+        def get_weather(city: str) -> str:
+            "Look up the weather."
+            return "sunny"
+
+        model = llm.get_model("gpt-4o-mini")
+        response = model.prompt(
+            "weather?", tools=[get_weather], key=API_KEY, stream=False
+        )
+        parts = response.messages()[0].parts
+        assert [type(part).__name__ for part in parts] == [
+            "ReasoningPart",
+            "ToolCallPart",
+        ]
+        assert parts[0].text == "I should look up the weather."
 
 
 class TestNonStreamingExecuteYieldsStreamEvents:
